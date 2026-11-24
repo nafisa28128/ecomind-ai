@@ -1,0 +1,9 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.Rproj
+data/
+models/*.h5
+models/*.keras
+.DS_Store
