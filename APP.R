@@ -104,10 +104,9 @@ load_waste_model <- function() {
 
   tryCatch({
 
-    reticulate::use_virtualenv(
-      "r-keras",
-      required = TRUE
-    )
+    if (Sys.getenv("POSIT_CONNECT") == "") {
+  reticulate::use_virtualenv("r-keras", required = TRUE)
+}
 
     tm <- reticulate::import("teachable_machine")
 
