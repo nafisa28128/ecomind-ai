@@ -1,0 +1,12 @@
+name: ecomind_ai_v4
+title: ecomind_ai_v4
+username: nmosaddek
+account: nmosaddek
+server: connect.posit.cloud
+hostUrl: https://api.connect.posit.cloud/v1
+appId: 01a20c1b-f66a-4c1a-39c0-8352cdcb155c
+bundleId:
+url: https://connect.posit.cloud/nmosaddek/content/01a20c1b-f66a-4c1a-39c0-8352cdcb155c
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
