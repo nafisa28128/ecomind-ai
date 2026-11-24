@@ -1,14 +1,19 @@
 
 # ============================================================
 # EcoMind AI - Smart Waste Intelligence
-# Integrated Google Teachable Machine image classifier
-# Updated interface: separate image and analysis panels
+# R Shiny + Google Teachable Machine
+# Cloud-compatible Python configuration for Posit Connect Cloud
 # ============================================================
 
-# ---------------- 1. PACKAGES ----------------
+# ---------------- 1. R PACKAGES ----------------
 
 required_packages <- c(
-  "shiny", "DBI", "RSQLite", "DT", "ggplot2", "reticulate"
+  "shiny",
+  "DBI",
+  "RSQLite",
+  "DT",
+  "ggplot2",
+  "reticulate"
 )
 
 missing_packages <- required_packages[
@@ -17,9 +22,8 @@ missing_packages <- required_packages[
 
 if (length(missing_packages) > 0) {
   stop(
-    "Missing packages: ",
-    paste(missing_packages, collapse = ", "),
-    ". Install them using install.packages()."
+    "Missing R packages: ",
+    paste(missing_packages, collapse = ", ")
   )
 }
 
@@ -31,7 +35,7 @@ library(ggplot2)
 
 # ---------------- 2. DIRECTORIES ----------------
 
-APP_DIR <- normalizePath(".", winslash = "/", mustWork = TRUE)
+APP_DIR <- getwd()
 
 DATA_DIR <- file.path(APP_DIR, "data")
 MODEL_DIR <- file.path(APP_DIR, "models")
@@ -44,45 +48,54 @@ dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
 dir.create(MODEL_DIR, showWarnings = FALSE, recursive = TRUE)
 
 MODEL_CATEGORIES <- c(
-  "Cardboard", "Glass", "Metal", "Paper", "Plastic", "Trash"
+  "Cardboard", "Glass", "Metal",
+  "Paper", "Plastic", "Trash"
 )
 
 # ---------------- 3. DATABASE ----------------
 
-con <- dbConnect(SQLite(), DB_PATH)
+initialize_database <- function() {
 
-dbExecute(con, "
-  CREATE TABLE IF NOT EXISTS waste_records (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL,
-    waste_type TEXT NOT NULL,
-    condition TEXT NOT NULL,
-    confidence REAL,
-    destination TEXT NOT NULL,
-    recommendation TEXT NOT NULL,
-    legal_context TEXT NOT NULL,
-    points INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
-  )
-")
+  con <- dbConnect(SQLite(), DB_PATH)
 
-existing_columns <- dbGetQuery(
-  con, "PRAGMA table_info(waste_records)"
-)$name
+  on.exit(dbDisconnect(con), add = TRUE)
 
-if (!"legal_context" %in% existing_columns) {
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS waste_records (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL,
+      waste_type TEXT NOT NULL,
+      condition TEXT NOT NULL,
+      confidence REAL,
+      destination TEXT NOT NULL,
+      recommendation TEXT NOT NULL,
+      legal_context TEXT NOT NULL DEFAULT '',
+      points INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    )
+  ")
+
+  existing_columns <- dbGetQuery(
+    con,
+    "PRAGMA table_info(waste_records)"
+  )$name
+
+  if (!"legal_context" %in% existing_columns) {
+    dbExecute(
+      con,
+      "ALTER TABLE waste_records
+       ADD COLUMN legal_context TEXT NOT NULL DEFAULT ''"
+    )
+  }
+
   dbExecute(
     con,
-    "ALTER TABLE waste_records ADD COLUMN legal_context TEXT NOT NULL DEFAULT ''"
+    "CREATE INDEX IF NOT EXISTS idx_records_user
+     ON waste_records(username)"
   )
 }
 
-dbExecute(
-  con,
-  "CREATE INDEX IF NOT EXISTS idx_records_user ON waste_records(username)"
-)
-
-dbDisconnect(con)
+initialize_database()
 
 get_connection <- function() {
   dbConnect(SQLite(), DB_PATH)
@@ -91,24 +104,55 @@ get_connection <- function() {
 # ---------------- 4. AI MODEL INTEGRATION ----------------
 
 model_object <- NULL
-model_status <- "AI model has not been loaded."
+
+model_status <- paste(
+  "AI model has not been loaded."
+)
 
 load_waste_model <- function() {
 
-  if (!file.exists(MODEL_PATH) || !file.exists(LABEL_PATH)) {
+  if (!file.exists(MODEL_PATH)) {
     return(list(
       model = NULL,
-      message = "Model files missing. Check the models folder."
+      message = paste(
+        "Model file missing:",
+        MODEL_PATH
+      )
+    ))
+  }
+
+  if (!file.exists(LABEL_PATH)) {
+    return(list(
+      model = NULL,
+      message = paste(
+        "Label file missing:",
+        LABEL_PATH
+      )
     ))
   }
 
   tryCatch({
 
-    if (Sys.getenv("POSIT_CONNECT") == "") {
-  reticulate::use_virtualenv("r-keras", required = TRUE)
-}
+    # IMPORTANT:
+    # Do not call use_virtualenv(), use_python(),
+    # or use_conda() inside a deployed application.
+    #
+    # Posit Connect Cloud selects Python through
+    # its deployment environment configuration.
 
-    tm <- reticulate::import("teachable_machine")
+    python_path <- Sys.getenv("RETICULATE_PYTHON")
+
+    if (nzchar(python_path)) {
+      message(
+        "Using configured Python: ",
+        python_path
+      )
+    }
+
+    tm <- reticulate::import(
+      "teachable_machine",
+      delay_load = FALSE
+    )
 
     trained_model <- tm$TeachableMachine(
       model_path = MODEL_PATH,
@@ -117,7 +161,10 @@ load_waste_model <- function() {
 
     list(
       model = trained_model,
-      message = "AI model loaded successfully. Ready for image classification."
+      message = paste(
+        "AI model loaded successfully.",
+        "Ready for image classification."
+      )
     )
 
   }, error = function(e) {
@@ -154,7 +201,11 @@ read_model_labels <- function() {
     )
   )
 
-  labels <- sub("^\\s*[0-9]+\\s+", "", labels)
+  labels <- sub(
+    "^\\s*[0-9]+\\s+",
+    "",
+    labels
+  )
 
   labels[nzchar(labels)]
 }
@@ -171,7 +222,9 @@ predict_waste_image <- function(image_path) {
     stop("Uploaded image could not be found.")
   }
 
-  prediction <- model_object$classify_image(image_path)
+  prediction <- model_object$classify_image(
+    image_path
+  )
 
   scores <- as.numeric(
     unlist(prediction$predictions)
@@ -180,16 +233,38 @@ predict_waste_image <- function(image_path) {
   labels <- read_model_labels()
 
   if (length(scores) != length(labels)) {
-    stop("The number of model outputs does not match labels.txt.")
+    stop(
+      "The number of model outputs does not match labels.txt."
+    )
   }
 
-  if (length(scores) == 0 || any(!is.finite(scores))) {
-    stop("The model returned invalid prediction scores.")
+  if (
+    length(scores) == 0 ||
+    any(!is.finite(scores))
+  ) {
+    stop(
+      "The model returned invalid prediction scores."
+    )
+  }
+
+  confidence <- as.numeric(
+    prediction$class_confidence
+  )
+
+  if (
+    length(confidence) != 1 ||
+    !is.finite(confidence)
+  ) {
+    stop(
+      "The model returned an invalid confidence score."
+    )
   }
 
   list(
-    label = as.character(prediction$class_name),
-    confidence = as.numeric(prediction$class_confidence),
+    label = as.character(
+      prediction$class_name
+    ),
+    confidence = confidence,
     scores = scores,
     labels = labels
   )
@@ -201,14 +276,52 @@ normalize_category <- function(label) {
 
   x <- tolower(trimws(label))
 
-  if (grepl("cardboard|corrugated", x)) return("Cardboard")
-  if (grepl("glass", x)) return("Glass")
-  if (grepl("metal|aluminium|aluminum|steel|tin", x)) return("Metal")
-  if (grepl("paper", x)) return("Paper")
-  if (grepl("plastic|polymer|pet|hdpe", x)) return("Plastic")
-  if (grepl("^trash$|misc|mixed|general", x)) return("Trash")
-  if (grepl("organic|food|compost|biodegradable", x)) return("Organic")
-  if (grepl("electronic|e.?waste|battery|phone|computer", x)) return("Electronic")
+  if (grepl("cardboard|corrugated", x)) {
+    return("Cardboard")
+  }
+
+  if (grepl("glass", x)) {
+    return("Glass")
+  }
+
+  if (grepl(
+    "metal|aluminium|aluminum|steel|tin",
+    x
+  )) {
+    return("Metal")
+  }
+
+  if (grepl("paper", x)) {
+    return("Paper")
+  }
+
+  if (grepl(
+    "plastic|polymer|pet|hdpe",
+    x
+  )) {
+    return("Plastic")
+  }
+
+  if (grepl(
+    "^trash$|misc|mixed|general",
+    x
+  )) {
+    return("Trash")
+  }
+
+  if (grepl(
+    "organic|food|compost|biodegradable",
+    x
+  )) {
+    return("Organic")
+  }
+
+  if (grepl(
+    "electronic|e.?waste|battery|phone|computer",
+    x
+  )) {
+    return("Electronic")
+  }
 
   "Other"
 }
@@ -218,123 +331,226 @@ normalize_category <- function(label) {
 GUIDANCE <- list(
 
   Cardboard = list(
-    material = "Paper-based fibre packaging, often corrugated.",
-    destination = "Keep separate for paper and cardboard recovery or a local recycling collector.",
+    material = paste(
+      "Paper-based fibre packaging, often corrugated."
+    ),
+    destination = paste(
+      "Keep separate for paper and cardboard recovery",
+      "or a local recycling collector."
+    ),
     action = c(
       "Keep it clean and dry.",
       "Flatten boxes to reduce storage and transport volume.",
       "Remove plastic wrapping, foam and excessive tape where practical.",
       "Do not mix heavily food-soiled or wet cardboard with clean recyclable paper."
     ),
-    caution = "Wet, oily or food-contaminated cardboard may not be accepted by all recyclers.",
+    caution = paste(
+      "Wet, oily or food-contaminated cardboard may not",
+      "be accepted by all recyclers."
+    ),
     points = 8L,
-    legal = "Bangladesh Solid Waste Management Rules, 2021 are relevant to municipal solid-waste management. Confirm applicable local collection requirements with your city corporation or municipality."
+    legal = paste(
+      "Bangladesh Solid Waste Management Rules, 2021",
+      "are relevant to municipal solid-waste management.",
+      "Confirm applicable local collection requirements",
+      "with your city corporation or municipality."
+    )
   ),
 
   Glass = list(
-    material = "Glass packaging or glass objects. The model does not identify glass type.",
-    destination = "Separate glass for a local glass collector or recovery service where accepted.",
+    material = paste(
+      "Glass packaging or glass objects.",
+      "The model does not identify glass type."
+    ),
+    destination = paste(
+      "Separate glass for a local glass collector",
+      "or recovery service where accepted."
+    ),
     action = c(
       "Keep glass separate from other recyclables.",
       "Do not place broken glass loose in a bag. Use a rigid, clearly marked container.",
       "Check whether the collector accepts the specific glass item."
     ),
-    caution = "Mirrors, ceramics, heat-resistant glass and window glass may not be accepted with bottle glass.",
+    caution = paste(
+      "Mirrors, ceramics, heat-resistant glass and window glass",
+      "may not be accepted with bottle glass."
+    ),
     points = 12L,
-    legal = "Follow applicable municipal solid-waste collection and worker-safety instructions."
+    legal = paste(
+      "Follow applicable municipal solid-waste collection",
+      "and worker-safety instructions."
+    )
   ),
 
   Metal = list(
-    material = "Potentially recoverable metal packaging or scrap. The model does not identify the alloy.",
-    destination = "Keep separate for a scrap-metal dealer or authorized recovery channel.",
+    material = paste(
+      "Potentially recoverable metal packaging or scrap.",
+      "The model does not identify the alloy."
+    ),
+    destination = paste(
+      "Keep separate for a scrap-metal dealer",
+      "or authorized recovery channel."
+    ),
     action = c(
       "Separate metal from food residue where safe and practical.",
       "Keep sharp edges contained to prevent injury.",
       "Do not handle unidentified chemical containers or pressurized cylinders as ordinary scrap."
     ),
-    caution = "A visual prediction cannot determine alloy, chemical contamination or whether an item is safe to handle.",
+    caution = paste(
+      "A visual prediction cannot determine alloy, chemical",
+      "contamination or whether an item is safe to handle."
+    ),
     points = 15L,
-    legal = "Use applicable municipal waste-management guidance. Special or contaminated metal waste may require a different handling route."
+    legal = paste(
+      "Use applicable municipal waste-management guidance.",
+      "Special or contaminated metal waste may require",
+      "a different handling route."
+    )
   ),
 
   Paper = list(
-    material = "Paper products such as office paper, newspapers and printed sheets.",
-    destination = "Keep clean paper separate for reuse or paper recycling.",
+    material = paste(
+      "Paper products such as office paper, newspapers",
+      "and printed sheets."
+    ),
+    destination = paste(
+      "Keep clean paper separate for reuse or paper recycling."
+    ),
     action = c(
       "Keep paper dry and free from food or oil.",
       "Reuse one-sided sheets where possible.",
       "Separate laminated, waxed or heavily coated paper if the collector requests it."
     ),
-    caution = "Not all paper products are recyclable in every local collection system.",
+    caution = paste(
+      "Not all paper products are recyclable",
+      "in every local collection system."
+    ),
     points = 8L,
-    legal = "Bangladesh Solid Waste Management Rules, 2021 provide the national solid-waste management framework."
+    legal = paste(
+      "Bangladesh Solid Waste Management Rules, 2021",
+      "provide the national solid-waste management framework."
+    )
   ),
 
   Plastic = list(
-    material = "Plastic item. Image classification does not reliably identify polymer resin or recycling code.",
-    destination = "Separate clean, accepted plastic items for a local plastic collector or recycling service.",
+    material = paste(
+      "Plastic item. Image classification does not reliably",
+      "identify polymer resin or recycling code."
+    ),
+    destination = paste(
+      "Separate clean, accepted plastic items for a local",
+      "plastic collector or recycling service."
+    ),
     action = c(
       "Empty the item and rinse it only when safe and practical.",
       "Check the resin code and ask the collector which types are accepted.",
       "Keep multilayer sachets and non-accepted plastics separate.",
       "Do not burn plastic or dump it into drains, canals or waterways."
     ),
-    caution = "The model cannot identify resin type, additives or food-contact safety from the image alone.",
+    caution = paste(
+      "The model cannot identify resin type, additives",
+      "or food-contact safety from the image alone."
+    ),
     points = 10L,
-    legal = "Bangladesh has a National Action Plan for Sustainable Plastic Management and the Solid Waste Management Rules, 2021."
+    legal = paste(
+      "Bangladesh has a National Action Plan for Sustainable",
+      "Plastic Management and the Solid Waste Management Rules, 2021."
+    )
   ),
 
   Trash = list(
-    material = "Mixed or miscellaneous waste. This category may contain recyclable, organic or hazardous items.",
-    destination = "Do not assume this item is non-recyclable. Inspect and separate its components where safe.",
+    material = paste(
+      "Mixed or miscellaneous waste.",
+      "This category may contain recyclable, organic or hazardous items."
+    ),
+    destination = paste(
+      "Do not assume this item is non-recyclable.",
+      "Inspect and separate its components where safe."
+    ),
     action = c(
       "Check whether the item contains paper, plastic, metal, glass or organic material.",
       "Keep batteries, electronics, chemicals, medical waste and sharp objects out of ordinary mixed waste.",
       "Seek advice from the local waste authority if the material is unknown."
     ),
-    caution = "The TrashNet Trash class is a miscellaneous training category, not a definitive waste-treatment category.",
+    caution = paste(
+      "The TrashNet Trash class is a miscellaneous training",
+      "category, not a definitive waste-treatment category."
+    ),
     points = 2L,
-    legal = "Follow the relevant city corporation or municipality's waste collection instructions."
+    legal = paste(
+      "Follow the relevant city corporation or municipality's",
+      "waste collection instructions."
+    )
   ),
 
   Organic = list(
-    material = "Potential biodegradable or food waste. This category is not part of the current six-class model.",
-    destination = "Use a municipal organic-waste or composting service where one exists.",
+    material = paste(
+      "Potential biodegradable or food waste.",
+      "This category is not part of the current six-class model."
+    ),
+    destination = paste(
+      "Use a municipal organic-waste or composting service",
+      "where one exists."
+    ),
     action = c(
       "Keep organic material separate from plastic and other contaminants.",
       "Use a covered container to reduce pests and odour.",
       "Compost only suitable materials."
     ),
-    caution = "Organic waste is currently available through manual selection only.",
+    caution = paste(
+      "Organic waste is currently available through manual selection only."
+    ),
     points = 10L,
-    legal = "Check the local authority's organic-waste collection and composting arrangements."
+    legal = paste(
+      "Check the local authority's organic-waste collection",
+      "and composting arrangements."
+    )
   ),
 
   Electronic = list(
-    material = "Potential electronic waste. This category is not part of the current six-class model.",
-    destination = "Use an authorized e-waste collection or take-back channel.",
+    material = paste(
+      "Potential electronic waste.",
+      "This category is not part of the current six-class model."
+    ),
+    destination = paste(
+      "Use an authorized e-waste collection or take-back channel."
+    ),
     action = c(
       "Do not put electronics or batteries in ordinary household bins.",
       "Do not dismantle, puncture, crush or burn batteries.",
       "Keep damaged or swollen batteries away from heat.",
       "Use a documented collection or take-back service."
     ),
-    caution = "The current model cannot detect or safely classify e-waste. Select this category manually.",
+    caution = paste(
+      "The current model cannot detect or safely classify e-waste.",
+      "Select this category manually."
+    ),
     points = 20L,
-    legal = "Bangladesh Hazardous Waste (E-Waste) Management Rules, 2021 are the relevant national regulatory reference."
+    legal = paste(
+      "Bangladesh Hazardous Waste (E-Waste) Management Rules, 2021",
+      "are the relevant national regulatory reference."
+    )
   ),
 
   Other = list(
     material = "Unclassified item.",
-    destination = "Check the item and local municipal guidance before disposal.",
+    destination = paste(
+      "Check the item and local municipal guidance before disposal."
+    ),
     action = c(
       "Do not assume the item is recyclable or safe based only on appearance.",
       "Separate identifiable recyclable components.",
       "Seek specialist advice for chemicals, batteries, medical waste or unknown hazardous materials."
     ),
-    caution = "AI classification is uncertain. Manual inspection is recommended.",
+    caution = paste(
+      "AI classification is uncertain.",
+      "Manual inspection is recommended."
+    ),
     points = 2L,
-    legal = "Consult the relevant city corporation or municipality and applicable waste-specific rules."
+    legal = paste(
+      "Consult the relevant city corporation or municipality",
+      "and applicable waste-specific rules."
+    )
   )
 )
 
@@ -355,7 +571,10 @@ get_guidance <- function(category, condition) {
 
     g$action <- c(
       g$action,
-      "The item is marked contaminated. Do not clean unknown chemical, medical or hazardous waste yourself."
+      paste(
+        "The item is marked contaminated.",
+        "Do not clean unknown chemical, medical or hazardous waste yourself."
+      )
     )
   }
 
@@ -368,7 +587,9 @@ ui <- fluidPage(
 
   tags$head(
 
-    tags$title("EcoMind AI | Smart Waste Intelligence"),
+    tags$title(
+      "EcoMind AI | Smart Waste Intelligence"
+    ),
 
     tags$style(HTML("
       @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Manrope:wght@600;700;800&display=swap');
@@ -498,8 +719,6 @@ ui <- fluidPage(
         font-size:12px;
         line-height:1.6;
       }
-
-      /* WASTE ANALYZER TWO-PANEL LAYOUT */
 
       .analyzer-heading {
         font-family:'Manrope',sans-serif;
@@ -686,10 +905,16 @@ ui <- fluidPage(
 
   div(
     class = "app-header",
-    div(class = "app-brand", "♻ EcoMind AI"),
+    div(
+      class = "app-brand",
+      "♻ EcoMind AI"
+    ),
     div(
       class = "app-subtitle",
-      "SMART WASTE INTELLIGENCE  •  IDENTIFY  /  RECOVER  /  REWARD"
+      paste(
+        "SMART WASTE INTELLIGENCE",
+        "• IDENTIFY / RECOVER / REWARD"
+      )
     )
   ),
 
@@ -704,7 +929,10 @@ ui <- fluidPage(
       ),
 
       helpText(
-        "Use a nickname. This prototype does not provide secure user accounts."
+        paste(
+          "Use a nickname.",
+          "This prototype does not provide secure user accounts."
+        )
       ),
 
       fileInput(
@@ -739,7 +967,10 @@ ui <- fluidPage(
       selectInput(
         "condition",
         "Item condition",
-        choices = c("Clean", "Contaminated")
+        choices = c(
+          "Clean",
+          "Contaminated"
+        )
       ),
 
       actionButton(
@@ -753,7 +984,10 @@ ui <- fluidPage(
 
       checkboxInput(
         "confirm_action",
-        "I have followed the suggested sorting / disposal action",
+        paste(
+          "I have followed the suggested",
+          "sorting / disposal action"
+        ),
         FALSE
       ),
 
@@ -788,12 +1022,18 @@ ui <- fluidPage(
           br(),
 
           fluidRow(
+
             column(
               4,
               div(
                 class = "metric",
                 h4("Items recorded"),
-                h3(textOutput("item_count", inline = TRUE))
+                h3(
+                  textOutput(
+                    "item_count",
+                    inline = TRUE
+                  )
+                )
               )
             ),
 
@@ -802,7 +1042,12 @@ ui <- fluidPage(
               div(
                 class = "metric",
                 h4("Reward points"),
-                h3(textOutput("points_total", inline = TRUE))
+                h3(
+                  textOutput(
+                    "points_total",
+                    inline = TRUE
+                  )
+                )
               )
             ),
 
@@ -811,7 +1056,12 @@ ui <- fluidPage(
               div(
                 class = "metric",
                 h4("Contributors"),
-                h3(textOutput("user_count", inline = TRUE))
+                h3(
+                  textOutput(
+                    "user_count",
+                    inline = TRUE
+                  )
+                )
               )
             )
           ),
@@ -826,7 +1076,6 @@ ui <- fluidPage(
 
         tabPanel(
           "Waste Analyzer",
-
           br(),
 
           h3(
@@ -836,12 +1085,13 @@ ui <- fluidPage(
 
           p(
             class = "analyzer-description",
-            "Upload a photograph and review the AI classification, material information and recommended recovery pathway."
+            paste(
+              "Upload a photograph and review the AI classification,",
+              "material information and recommended recovery pathway."
+            )
           ),
 
           fluidRow(
-
-            # LEFT: COMPACT IMAGE PANEL
 
             column(
               4,
@@ -857,18 +1107,18 @@ ui <- fluidPage(
 
                 div(
                   class = "image-preview-area",
-
                   uiOutput("image_preview_area")
                 ),
 
                 p(
                   class = "small-note",
-                  "Your uploaded photograph is displayed separately from the analysis."
+                  paste(
+                    "Your uploaded photograph is displayed",
+                    "separately from the analysis."
+                  )
                 )
               )
             ),
-
-            # RIGHT: TEXT AND ANALYSIS PANEL
 
             column(
               8,
@@ -876,7 +1126,6 @@ ui <- fluidPage(
 
               div(
                 class = "analysis-panel",
-
                 uiOutput("analysis_result")
               )
             )
@@ -900,28 +1149,48 @@ ui <- fluidPage(
           h4("Current model scope"),
 
           p(
-            "The current image model was trained using six TrashNet-style classes: Cardboard, Glass, Metal, Paper, Plastic and Trash."
+            paste(
+              "The current image model was trained using six",
+              "TrashNet-style classes: Cardboard, Glass, Metal,",
+              "Paper, Plastic and Trash."
+            )
           ),
 
           p(
-            "Organic and Electronic are manual-only categories in this version. They are not recognised by the current trained model."
+            paste(
+              "Organic and Electronic are manual-only categories",
+              "in this version. They are not recognised by the",
+              "current trained model."
+            )
           ),
 
           p(
-            "A model confidence score is not the same as accuracy. Test the model using new images before relying on its predictions."
+            paste(
+              "A model confidence score is not the same as accuracy.",
+              "Test the model using new images before relying on its predictions."
+            )
           ),
 
           h4("Important limitations"),
 
           tags$ul(
             tags$li(
-              "A photo cannot reliably identify polymer resin, chemical contamination, glass composition or battery condition."
+              paste(
+                "A photo cannot reliably identify polymer resin,",
+                "chemical contamination, glass composition or battery condition."
+              )
             ),
             tags$li(
-              "The Trash class is broad and should not be treated as a specific disposal instruction."
+              paste(
+                "The Trash class is broad and should not be treated",
+                "as a specific disposal instruction."
+              )
             ),
             tags$li(
-              "Legal guidance is informational. Confirm exact requirements with the official legal text and relevant local authority."
+              paste(
+                "Legal guidance is informational. Confirm exact",
+                "requirements with the official legal text and relevant local authority."
+              )
             )
           )
         )
@@ -942,15 +1211,17 @@ server <- function(input, output, session) {
 
     nm <- trimws(input$username)
 
-    if (is.null(nm) || !nzchar(nm)) {
+    if (
+      is.null(nm) ||
+      !nzchar(nm)
+    ) {
       "Guest"
     } else {
       substr(nm, 1, 40)
     }
-
   })
 
-  # Retrieve saved activities.
+  # ---------------- DATABASE RETRIEVAL ----------------
 
   fetch_records <- function() {
 
@@ -962,9 +1233,17 @@ server <- function(input, output, session) {
     )
 
     dbGetQuery(con, "
-      SELECT id, username, waste_type, condition,
-             confidence, destination, recommendation,
-             legal_context, points, created_at
+      SELECT
+        id,
+        username,
+        waste_type,
+        condition,
+        confidence,
+        destination,
+        recommendation,
+        legal_context,
+        points,
+        created_at
       FROM waste_records
       ORDER BY id DESC
     ")
@@ -975,14 +1254,13 @@ server <- function(input, output, session) {
     fetch_records()
   })
 
-  # Model status.
+  # ---------------- MODEL STATUS ----------------
 
   output$model_status <- renderText({
     model_status
   })
 
-  # Uploaded image preview.
-  # The image is rendered only inside the separate image panel.
+  # ---------------- IMAGE PREVIEW ----------------
 
   output$image_preview_area <- renderUI({
 
@@ -1006,7 +1284,6 @@ server <- function(input, output, session) {
           "Upload a waste photograph using the sidebar."
         )
       )
-
     }
 
     imageOutput(
@@ -1014,7 +1291,6 @@ server <- function(input, output, session) {
       height = "260px",
       width = "100%"
     )
-
   })
 
   output$image_preview <- renderImage({
@@ -1043,7 +1319,12 @@ server <- function(input, output, session) {
       low_confidence <- FALSE
       score_table <- NULL
 
-      if (identical(input$manual_type, "AUTO")) {
+      if (
+        identical(
+          input$manual_type,
+          "AUTO"
+        )
+      ) {
 
         req(input$waste_image)
 
@@ -1080,7 +1361,10 @@ server <- function(input, output, session) {
         )
 
         score_table <- score_table[
-          order(score_table$Score, decreasing = TRUE),
+          order(
+            score_table$Score,
+            decreasing = TRUE
+          ),
           ,
           drop = FALSE
         ]
@@ -1088,7 +1372,6 @@ server <- function(input, output, session) {
       } else {
 
         category <- input$manual_type
-
       }
 
       guidance_category <- if (low_confidence) {
@@ -1116,7 +1399,10 @@ server <- function(input, output, session) {
         caution = g$caution,
         legal = g$legal,
         points = g$points,
-        is_manual = !identical(input$manual_type, "AUTO")
+        is_manual = !identical(
+          input$manual_type,
+          "AUTO"
+        )
       ))
 
       updateTabsetPanel(
@@ -1126,7 +1412,10 @@ server <- function(input, output, session) {
       )
 
       showNotification(
-        "Analysis completed. Review the limitations before acting.",
+        paste(
+          "Analysis completed.",
+          "Review the limitations before acting."
+        ),
         type = "message"
       )
 
@@ -1142,9 +1431,7 @@ server <- function(input, output, session) {
         type = "error",
         duration = 12
       )
-
     })
-
   })
 
   # ---------------- DISPLAY RESULTS ----------------
@@ -1164,7 +1451,11 @@ server <- function(input, output, session) {
           ),
 
           p(
-            "Upload a photograph and click Analyze item. The AI classification and recommendations will be displayed in this panel."
+            paste(
+              "Upload a photograph and click Analyze item.",
+              "The AI classification and recommendations",
+              "will be displayed in this panel."
+            )
           ),
 
           div(
@@ -1173,19 +1464,23 @@ server <- function(input, output, session) {
             strong("Supported AI categories"),
 
             p(
-              "Cardboard, Glass, Metal, Paper, Plastic and Trash."
+              paste(
+                "Cardboard, Glass, Metal, Paper, Plastic and Trash."
+              )
             ),
 
             p(
-              "Organic and Electronic are available through manual selection only."
+              paste(
+                "Organic and Electronic are available",
+                "through manual selection only."
+              )
             )
           )
         )
       )
-
     }
 
-    # Confidence display.
+    # ---------------- CONFIDENCE DISPLAY ----------------
 
     conf_ui <- if (is.finite(x$confidence)) {
 
@@ -1208,7 +1503,10 @@ server <- function(input, output, session) {
             class = "confidence-fill",
             style = paste0(
               "width:",
-              max(0, min(100, x$confidence * 100)),
+              max(
+                0,
+                min(100, x$confidence * 100)
+              ),
               "%;"
             )
           )
@@ -1216,23 +1514,29 @@ server <- function(input, output, session) {
 
         p(
           class = "small-note",
-          "Confidence is the model's score for this prediction, not independently measured accuracy."
+          paste(
+            "Confidence is the model's score for this prediction,",
+            "not independently measured accuracy."
+          )
         )
-
       )
 
     } else {
 
       p(
         class = "small-note",
-        "Category selected manually. No AI confidence score is available."
+        paste(
+          "Category selected manually.",
+          "No AI confidence score is available."
+        )
       )
-
     }
 
-    # Low-confidence warning.
+    # ---------------- LOW CONFIDENCE WARNING ----------------
 
-    warning_ui <- if (isTRUE(x$low_confidence)) {
+    warning_ui <- if (
+      isTRUE(x$low_confidence)
+    ) {
 
       div(
         class = "warning-card",
@@ -1240,7 +1544,12 @@ server <- function(input, output, session) {
         strong("Low-confidence prediction"),
 
         p(
-          "The model is not sufficiently certain (below the provisional 60% threshold). The material-specific guidance is withheld. Retake the photo or select the category manually."
+          paste(
+            "The model is not sufficiently certain",
+            "(below the provisional 60% threshold).",
+            "The material-specific guidance is withheld.",
+            "Retake the photo or select the category manually."
+          )
         )
       )
 
@@ -1248,7 +1557,7 @@ server <- function(input, output, session) {
       NULL
     }
 
-    # Other model scores.
+    # ---------------- OTHER MODEL SCORES ----------------
 
     score_ui <- if (!is.null(x$score_table)) {
 
@@ -1260,16 +1569,15 @@ server <- function(input, output, session) {
         ),
 
         DTOutput("prediction_scores")
-
       )
 
     } else {
       NULL
     }
 
-    tagList(
+    # ---------------- COMPLETE RESULT ----------------
 
-      # IDENTIFICATION
+    tagList(
 
       div(
         class = "result-card",
@@ -1291,7 +1599,10 @@ server <- function(input, output, session) {
 
         p(
           if (!is.null(x$prediction_label)) {
-            paste("Original model label:", x$prediction_label)
+            paste(
+              "Original model label:",
+              x$prediction_label
+            )
           } else {
             "Manual category selection"
           }
@@ -1331,7 +1642,10 @@ server <- function(input, output, session) {
         ),
 
         tags$ul(
-          lapply(x$action, tags$li)
+          lapply(
+            x$action,
+            tags$li
+          )
         ),
 
         div(
@@ -1343,7 +1657,7 @@ server <- function(input, output, session) {
         )
       ),
 
-      # REGULATORY CONTEXT
+      # BANGLADESH REGULATORY CONTEXT
 
       div(
         class = "result-card",
@@ -1357,14 +1671,21 @@ server <- function(input, output, session) {
 
         p(
           class = "small-note",
-          "This is general information, not a legal determination. Check the official gazette and your local authority for current requirements."
+          paste(
+            "This is general information, not a legal determination.",
+            "Check the official gazette and your local authority",
+            "for current requirements."
+          )
         ),
 
         tags$ul(
 
           tags$li(
             a(
-              "Bangladesh Solid Waste Management Rules, 2021: verify official gazette text",
+              paste(
+                "Bangladesh Solid Waste Management Rules, 2021:",
+                "verify official gazette text"
+              ),
               href = "https://moef.gov.bd/",
               target = "_blank",
               class = "source-link"
@@ -1382,13 +1703,15 @@ server <- function(input, output, session) {
 
           tags$li(
             a(
-              "Bangladesh National Action Plan for Sustainable Plastic Management",
+              paste(
+                "Bangladesh National Action Plan",
+                "for Sustainable Plastic Management"
+              ),
               href = "https://doe.gov.bd/",
               target = "_blank",
               class = "source-link"
             )
           )
-
         )
       ),
 
@@ -1413,12 +1736,13 @@ server <- function(input, output, session) {
 
         p(
           class = "small-note",
-          "Points are prototype incentives, not money and not proof of recycling or environmental impact."
+          paste(
+            "Points are prototype incentives, not money",
+            "and not proof of recycling or environmental impact."
+          )
         )
       )
-
     )
-
   })
 
   # ---------------- MODEL SCORE TABLE ----------------
@@ -1427,7 +1751,10 @@ server <- function(input, output, session) {
 
     x <- analysis()
 
-    req(x, x$score_table)
+    req(
+      x,
+      x$score_table
+    )
 
     datatable(
       x$score_table,
@@ -1438,7 +1765,6 @@ server <- function(input, output, session) {
         ordering = FALSE
       )
     )
-
   })
 
   # ---------------- SAVE ACTIVITY ----------------
@@ -1460,7 +1786,10 @@ server <- function(input, output, session) {
     if (isTRUE(x$low_confidence)) {
 
       showNotification(
-        "Please manually verify the category before saving a low-confidence prediction.",
+        paste(
+          "Please manually verify the category",
+          "before saving a low-confidence prediction."
+        ),
         type = "warning"
       )
 
@@ -1470,7 +1799,10 @@ server <- function(input, output, session) {
     if (!isTRUE(input$confirm_action)) {
 
       showNotification(
-        "Confirm that you followed the suggested action before claiming points.",
+        paste(
+          "Confirm that you followed the suggested action",
+          "before claiming points."
+        ),
         type = "warning"
       )
 
@@ -1486,7 +1818,9 @@ server <- function(input, output, session) {
 
         paste(
           "INSERT INTO waste_records",
-          "(username, waste_type, condition, confidence, destination, recommendation, legal_context, points, created_at)",
+          "(username, waste_type, condition, confidence,",
+          "destination, recommendation, legal_context,",
+          "points, created_at)",
           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ),
 
@@ -1506,7 +1840,10 @@ server <- function(input, output, session) {
 
           x$destination,
 
-          paste(x$action, collapse = " "),
+          paste(
+            x$action,
+            collapse = " "
+          ),
 
           x$legal,
 
@@ -1516,7 +1853,6 @@ server <- function(input, output, session) {
             Sys.time(),
             "%Y-%m-%d %H:%M:%S"
           )
-
         )
       )
 
@@ -1546,9 +1882,7 @@ server <- function(input, output, session) {
     }, finally = {
 
       dbDisconnect(con)
-
     })
-
   })
 
   # ---------------- DASHBOARD METRICS ----------------
@@ -1558,7 +1892,10 @@ server <- function(input, output, session) {
   })
 
   output$points_total <- renderText({
-    sum(records()$points, na.rm = TRUE)
+    sum(
+      records()$points,
+      na.rm = TRUE
+    )
   })
 
   output$user_count <- renderText({
@@ -1568,9 +1905,10 @@ server <- function(input, output, session) {
     if (nrow(d) == 0) {
       0
     } else {
-      length(unique(d$username))
+      length(
+        unique(d$username)
+      )
     }
-
   })
 
   # ---------------- WASTE ACTIVITY CHART ----------------
@@ -1582,7 +1920,10 @@ server <- function(input, output, session) {
     validate(
       need(
         nrow(d) > 0,
-        "No activity yet. Analyze and save your first item."
+        paste(
+          "No activity yet.",
+          "Analyze and save your first item."
+        )
       )
     )
 
@@ -1598,7 +1939,10 @@ server <- function(input, output, session) {
     ggplot(
       counts,
       aes(
-        x = reorder(`Waste type`, -Items),
+        x = reorder(
+          `Waste type`,
+          -Items
+        ),
         y = Items
       )
     ) +
@@ -1614,7 +1958,9 @@ server <- function(input, output, session) {
         title = "Waste activity by category"
       ) +
 
-      theme_minimal(base_size = 13) +
+      theme_minimal(
+        base_size = 13
+      ) +
 
       theme(
         plot.title = element_text(
@@ -1631,7 +1977,6 @@ server <- function(input, output, session) {
 
         panel.grid.minor = element_blank()
       )
-
   })
 
   # ---------------- ACTIVITY HISTORY ----------------
@@ -1647,17 +1992,21 @@ server <- function(input, output, session) {
           data.frame(
             Message = "No records yet."
           ),
-          options = list(dom = "t")
+          options = list(
+            dom = "t"
+          )
         )
       )
-
     }
 
     d$confidence <- ifelse(
       is.na(d$confidence),
       "Manual",
       paste0(
-        round(d$confidence * 100, 1),
+        round(
+          d$confidence * 100,
+          1
+        ),
         "%"
       )
     )
@@ -1684,16 +2033,17 @@ server <- function(input, output, session) {
         pageLength = 8,
         scrollX = TRUE
       )
-
     )
-
   })
-
 }
 
 # ---------------- 11. RUN APPLICATION ----------------
 
 shinyApp(
+  ui = ui,
+  server = server
+)
+
   ui = ui,
   server = server
 )
