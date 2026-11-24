@@ -2044,6 +2044,4 @@ shinyApp(
   server = server
 )
 
-  ui = ui,
-  server = server
-
+ 
